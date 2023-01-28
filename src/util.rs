@@ -231,8 +231,8 @@ impl<'r> FromParam<'r> for SafeString {
 
 // Log all the routes from the main paths list, and the attachments endpoint
 // Effectively ignores, any static file route, and the alive endpoint
-const LOGGED_ROUTES: [&str; 6] =
-    ["/api", "/admin", "/identity", "/icons", "/notifications/hub/negotiate", "/attachments"];
+const LOGGED_ROUTES: [&str; 7] =
+    ["/api", "/admin", "/identity", "/icons", "/notifications/hub/negotiate", "/attachments", "/key-connector"];
 
 // Boolean is extra debug, when true, we ignore the whitelist above and also print the mounts
 pub struct BetterLogging(pub bool);

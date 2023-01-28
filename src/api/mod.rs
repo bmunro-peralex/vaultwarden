@@ -2,6 +2,7 @@ mod admin;
 pub mod core;
 mod icons;
 mod identity;
+mod keyconnector;
 mod notifications;
 mod web;
 
@@ -21,6 +22,7 @@ pub use crate::api::{
     icons::routes as icons_routes,
     identity::routes as identity_routes,
     notifications::routes as notifications_routes,
+    keyconnector::routes as keyconnector_routes,
     notifications::{start_notification_server, Notify, UpdateType},
     web::catchers as web_catchers,
     web::routes as web_routes,
