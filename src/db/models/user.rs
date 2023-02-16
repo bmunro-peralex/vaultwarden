@@ -44,6 +44,8 @@ db_object! {
 
         pub client_kdf_type: i32,
         pub client_kdf_iter: i32,
+        pub client_kdf_memory: Option<i32>,
+        pub client_kdf_parallelism: Option<i32>,
 
         pub api_key: Option<String>,
 
@@ -56,6 +58,11 @@ db_object! {
     pub struct Invitation {
         pub email: String,
     }
+}
+
+pub enum UserKdfType {
+    Pbkdf2 = 0,
+    Argon2id = 1,
 }
 
 enum UserStatus {
@@ -73,7 +80,7 @@ pub struct UserStampException {
 
 /// Local methods
 impl User {
-    pub const CLIENT_KDF_TYPE_DEFAULT: i32 = 0; // PBKDF2: 0
+    pub const CLIENT_KDF_TYPE_DEFAULT: i32 = UserKdfType::Pbkdf2 as i32;
     pub const CLIENT_KDF_ITER_DEFAULT: i32 = 600_000;
 
     pub fn new(email: String) -> Self {
@@ -113,6 +120,8 @@ impl User {
 
             client_kdf_type: Self::CLIENT_KDF_TYPE_DEFAULT,
             client_kdf_iter: Self::CLIENT_KDF_ITER_DEFAULT,
+            client_kdf_memory: None,
+            client_kdf_parallelism: None,
 
             api_key: None,
 
@@ -150,7 +159,7 @@ impl User {
     /// * `new_key` - A String  which contains the new aKey value of the users master password.
     /// * `allow_next_route` - A Option<Vec<String>> with the function names of the next allowed (rocket) routes.
     ///                       These routes are able to use the previous stamp id for the next 2 minutes.
-    ///                       After these 2 minutes this stamp will expire.f
+    ///                       After these 2 minutes this stamp will expire.
     ///
     pub fn set_password(
         &mut self,
