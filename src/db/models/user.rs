@@ -50,6 +50,7 @@ db_object! {
         pub api_key: Option<String>,
 
         pub avatar_color: Option<String>,
+        pub uses_key_connector: bool,
     }
 
     #[derive(Identifiable, Queryable, Insertable)]
@@ -126,6 +127,7 @@ impl User {
             api_key: None,
 
             avatar_color: None,
+            uses_key_connector: false,
         }
     }
 
@@ -252,6 +254,7 @@ impl User {
             "Providers": [],
             "ProviderOrganizations": [],
             "ForcePasswordReset": false,
+            "UsesKeyConnector": self.uses_key_connector,
             "AvatarColor": self.avatar_color,
             "Object": "profile",
         })
