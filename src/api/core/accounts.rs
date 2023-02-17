@@ -275,7 +275,7 @@ async fn post_set_password(data: JsonUpcase<SetPasswordData>, headers: Headers, 
 }
 
 #[post("/accounts/set-key-connector-key", data = "<data>")]
-async fn post_set_key_connector_key(data: JsonUpcase<SetKeyConnectorData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn post_set_key_connector_key(data: JsonUpcase<SetKeyConnectorData>, headers: Headers, mut conn: DbConn, ip: ClientIp,) -> JsonResult {
     let data: SetKeyConnectorData = data.into_inner().data;
     let mut user = headers.user;
 
@@ -288,12 +288,14 @@ async fn post_set_key_connector_key(data: JsonUpcase<SetKeyConnectorData>, heade
     }
     
     user.akey = data.Key;
-
+    user.uses_key_connector = true;
 
     if let Some(keys) = data.Keys {
         user.private_key = Some(keys.EncryptedPrivateKey);
         user.public_key = Some(keys.PublicKey);
     }
+
+    log_user_event(EventType::UserMigratedKeyToKeyConnector as i32, &user.uuid, headers.device.atype, &ip.ip, &mut conn).await;
 
     user.save(&mut conn).await?;
     Ok(Json(json!({
