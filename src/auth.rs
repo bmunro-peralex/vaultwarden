@@ -19,6 +19,8 @@ pub static JWT_LOGIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|login", CON
 static JWT_INVITE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|invite", CONFIG.domain_origin()));
 static JWT_EMERGENCY_ACCESS_INVITE_ISSUER: Lazy<String> =
     Lazy::new(|| format!("{}|emergencyaccessinvite", CONFIG.domain_origin()));
+static JWT_SSOTOKEN_ISSUER: Lazy<String> =
+    Lazy::new(|| format!("{}|ssotoken", CONFIG.domain_origin()));
 static JWT_DELETE_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|delete", CONFIG.domain_origin()));
 static JWT_VERIFYEMAIL_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|verifyemail", CONFIG.domain_origin()));
 static JWT_ADMIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|admin", CONFIG.domain_origin()));
@@ -78,6 +80,10 @@ pub fn decode_invite(token: &str) -> Result<InviteJwtClaims, Error> {
 
 pub fn decode_emergency_access_invite(token: &str) -> Result<EmergencyAccessInviteJwtClaims, Error> {
     decode_jwt(token, JWT_EMERGENCY_ACCESS_INVITE_ISSUER.to_string())
+}
+
+pub fn decode_ssotoken(token: &str) -> Result<SsoTokenJwtClaims, Error> {
+    decode_jwt(token, JWT_SSOTOKEN_ISSUER.to_string())
 }
 
 pub fn decode_delete(token: &str) -> Result<BasicJwtClaims, Error> {
@@ -204,6 +210,33 @@ pub fn generate_emergency_access_invite_claims(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct SsoTokenJwtClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+    pub domainhint: String,
+}
+
+pub fn generate_ssotoken_claims(
+    org_id: String,
+    domainhint: String,
+) -> SsoTokenJwtClaims {
+    let time_now = Utc::now().naive_utc();
+    SsoTokenJwtClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::minutes(2)).timestamp(),
+        iss: JWT_SSOTOKEN_ISSUER.to_string(),
+        sub: org_id,
+        domainhint,
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BasicJwtClaims {
     // Not before
     pub nbf: i64,
@@ -256,6 +289,7 @@ pub fn generate_send_claims(send_id: &str, file_id: &str) -> BasicJwtClaims {
         sub: format!("{send_id}/{file_id}"),
     }
 }
+
 
 //
 // Bearer token authentication

@@ -16,7 +16,7 @@ use crate::{
         core::two_factor::{duo, email, email::EmailTokenData, yubikey},
         ApiResult, EmptyResult, JsonResult, JsonUpcase,
     },
-    auth::{ClientHeaders, ClientIp},
+    auth::{ClientHeaders, ClientIp,encode_jwt, generate_ssotoken_claims,},
     db::{models::*, DbConn},
     error::MapResult,
     mail, util, CONFIG,
@@ -235,6 +235,7 @@ async fn _authorization_login(
                         "ResetMasterPassword": user.password_hash.is_empty(),
                         // "forcePasswordReset": false,
                         // "keyConnectorUrl": false,
+                        "apiUseKeyConnector": false,
                         "scope": scope,
                         "unofficialServer": true,
                     });
@@ -761,12 +762,27 @@ fn _check_is_some<T>(value: &Option<T>, msg: &str) -> EmptyResult {
     Ok(())
 }
 
-#[get("/account/prevalidate")]
+#[get("/account/prevalidate?<domainHint>")]
 #[allow(non_snake_case)]
-fn prevalidate() -> JsonResult {
-    Ok(Json(json!({
-        "token": "",
-    })))
+async fn prevalidate(domainHint: String,mut conn: DbConn) -> JsonResult {
+
+    match Organization::find_by_identifier(&domainHint,&mut  conn).await {
+        Some(org) => {
+            let claims = generate_ssotoken_claims(
+                String::from(org.uuid),
+                String::from(domainHint),
+            );
+            let ssotoken = encode_jwt(&claims);
+            Ok(Json(json!({
+                "token": ssotoken,
+            })))
+        },
+        None => {
+            Ok(Json(json!({
+                "token": "",
+            })))
+        }
+    }
 }
 
 use openidconnect::core::{CoreClient, CoreProviderMetadata, CoreResponseType};
