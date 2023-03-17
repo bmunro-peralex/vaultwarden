@@ -115,6 +115,9 @@ webauthn-rs = "0.3.2"
 # Handling of URL's for WebAuthn and favicons
 url = "2.3.1"
 
+#Converting strings to uri for sso redirects
+http = "0.2.9"
+
 # Email libraries
 lettre = { version = "0.10.3", features = ["smtp-transport", "sendmail-transport", "builder", "serde", "tokio1-native-tls", "hostname", "tracing", "tokio1"], default-features = false }
 percent-encoding = "2.2.0" # URL encoding library used for URL's in the emails

@@ -82,10 +82,6 @@ pub fn decode_emergency_access_invite(token: &str) -> Result<EmergencyAccessInvi
     decode_jwt(token, JWT_EMERGENCY_ACCESS_INVITE_ISSUER.to_string())
 }
 
-pub fn decode_ssotoken(token: &str) -> Result<SsoTokenJwtClaims, Error> {
-    decode_jwt(token, JWT_SSOTOKEN_ISSUER.to_string())
-}
-
 pub fn decode_delete(token: &str) -> Result<BasicJwtClaims, Error> {
     decode_jwt(token, JWT_DELETE_ISSUER.to_string())
 }

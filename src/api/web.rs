@@ -14,7 +14,7 @@ pub fn routes() -> Vec<Route> {
     // If addding more routes here, consider also adding them to
     // crate::utils::LOGGED_ROUTES to make sure they appear in the log
     if CONFIG.web_vault_enabled() {
-        routes![web_index, app_id, web_files, attachments, alive, static_files]
+        routes![web_index, web_sso_connector, app_id, web_files, attachments, alive, static_files]
     } else {
         routes![attachments, alive, static_files]
     }
@@ -78,6 +78,11 @@ fn app_id() -> Cached<(ContentType, Json<Value>)> {
 #[get("/<p..>", rank = 10)] // Only match this if the other routes don't match
 async fn web_files(p: PathBuf) -> Cached<Option<NamedFile>> {
     Cached::long(NamedFile::open(Path::new(&CONFIG.web_vault_folder()).join(p)).await.ok(), true)
+}
+
+#[get("/sso-connector.html")]  
+async fn web_sso_connector() -> Cached<Option<NamedFile>>{
+    Cached::short(NamedFile::open(Path::new(&CONFIG.web_vault_folder()).join("sso-connector.html")).await.ok(), false)
 }
 
 #[get("/attachments/<uuid>/<file_id>")]

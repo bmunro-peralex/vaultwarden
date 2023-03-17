@@ -4,9 +4,9 @@ use num_traits::FromPrimitive;
 use rocket::serde::json::Json;
 use rocket::{
     form::{Form, FromForm},
-    response::Redirect,
     Route,
 };
+use http::{Request, Response, StatusCode};
 use serde_json::Value;
 
 use crate::{
@@ -819,21 +819,31 @@ async fn get_client_from_sso_config() -> Result<CoreClient, &'static str> {
 
 #[get("/connect/oidc-signin?<code>&<state>")]
 fn oidcsignin(code: String, state: String, _conn: DbConn) -> ApiResult<Redirect> {
-    //TODO this needs to be cleaned up, there should be a better way to do this.
+
+    //TODO this needs to be cleaned up, there should be a better way to do this.    
     let mut redirect_uri: &str = "";
     let split: Vec<_> = state.split('_').collect();
     let oldstate = String::new() + split[0] + "_" + split[1];
     for x in split {
-        if x.contains("redirecturl") {
-            redirect_uri = x.split('=').nth(1).unwrap();
+        if x.contains("returnUri") {
+            redirect_uri = &x.split('=').nth(1).unwrap();
         }
     }
 
-    Ok(Redirect::to(format!("{redirect_uri}?code={code}&state={oldstate}")))
+    let client = get_reqwest_client();
+    client
+        .request(m, &url)
+        .basic_auth(username, Some(password))
+        .header(header::USER_AGENT, "vaultwarden:Duo/1.0 (Rust)")
+        .header(header::DATE, date)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
-#[get("/connect/authorize?<redirect_uri>&<state>")]
-async fn authorize(redirect_uri: String, state: String, mut conn: DbConn) -> ApiResult<Redirect> {
+#[get("/connect/authorize?<client_id>&<redirect_uri>&<state>")]
+async fn authorize(client_id: String, redirect_uri: String, state: String, mut conn: DbConn) -> ApiResult<Redirect> {
     match get_client_from_sso_config().await {
         Ok(client) => {
             let (mut authorize_url, _csrf_state, nonce) = client
@@ -855,7 +865,7 @@ async fn authorize(redirect_uri: String, state: String, mut conn: DbConn) -> Api
             let new_pairs = old_pairs.map(|pair| {
                 let (key, value) = pair;
                 if key == "state" {
-                    return format!("{key}={state}_redirecturl={redirect_uri}");
+                    return format!("{key}={state}_clientId={client_id}_returnUri={redirect_uri}");
                 }
                 format!("{key}={value}")
             });
