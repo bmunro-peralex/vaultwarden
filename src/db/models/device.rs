@@ -1,6 +1,7 @@
 use chrono::{NaiveDateTime, Utc};
+use data_encoding::{BASE64, BASE64URL};
 
-use crate::{crypto, CONFIG};
+use crate::crypto;
 use core::fmt;
 
 db_object! {
@@ -16,7 +17,7 @@ db_object! {
         pub user_uuid: String,
 
         pub name: String,
-        pub atype: i32,         // https://github.com/bitwarden/server/blob/master/src/Core/Enums/DeviceType.cs
+        pub atype: i32,         // https://github.com/bitwarden/server/blob/dcc199bcce4aa2d5621f6fab80f1b49d8b143418/src/Core/Enums/DeviceType.cs
         pub push_uuid: Option<String>,
         pub push_token: Option<String>,
 
@@ -42,13 +43,12 @@ impl Device {
 
             push_uuid: None,
             push_token: None,
-            refresh_token: String::new(),
+            refresh_token: crypto::encode_random_bytes::<64>(BASE64URL),
             twofactor_remember: None,
         }
     }
 
     pub fn refresh_twofactor_remember(&mut self) -> String {
-        use data_encoding::BASE64;
         let twofactor_remember = crypto::encode_random_bytes::<180>(BASE64);
         self.twofactor_remember = Some(twofactor_remember.clone());
 
@@ -59,59 +59,12 @@ impl Device {
         self.twofactor_remember = None;
     }
 
-    pub fn refresh_tokens(&mut self, user: &super::User, scope: Vec<String>) -> (String, i64) {
-        // If there is no refresh token, we create one
-        if self.refresh_token.is_empty() {
-            use data_encoding::BASE64URL;
-            self.refresh_token = crypto::encode_random_bytes::<64>(BASE64URL);
-        }
+    pub fn is_push_device(&self) -> bool {
+        matches!(DeviceType::from_i32(self.atype), DeviceType::Android | DeviceType::Ios)
+    }
 
-        // Update the expiration of the device and the last update date
-        let time_now = Utc::now().naive_utc();
-        self.updated_at = time_now;
-
-        // ---
-        // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
-        // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
-        // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
-        // ---
-        // fn arg: orgs: Vec<super::UserOrganization>,
-        // ---
-        // let orgowner: Vec<_> = orgs.iter().filter(|o| o.atype == 0).map(|o| o.org_uuid.clone()).collect();
-        // let orgadmin: Vec<_> = orgs.iter().filter(|o| o.atype == 1).map(|o| o.org_uuid.clone()).collect();
-        // let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
-        // let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
-
-        // Create the JWT claims struct, to send to the client
-        use crate::auth::{encode_jwt, LoginJwtClaims, DEFAULT_VALIDITY, JWT_LOGIN_ISSUER};
-        let claims = LoginJwtClaims {
-            nbf: time_now.timestamp(),
-            exp: (time_now + *DEFAULT_VALIDITY).timestamp(),
-            iss: JWT_LOGIN_ISSUER.to_string(),
-            sub: user.uuid.clone(),
-
-            premium: true,
-            name: user.name.clone(),
-            email: user.email.clone(),
-            email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
-
-            // ---
-            // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
-            // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
-            // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
-            // See: https://github.com/dani-garcia/vaultwarden/issues/4156
-            // ---
-            // orgowner,
-            // orgadmin,
-            // orguser,
-            // orgmanager,
-            sstamp: user.security_stamp.clone(),
-            device: self.uuid.clone(),
-            scope,
-            amr: vec!["Application".into()],
-        };
-
-        (encode_jwt(&claims), DEFAULT_VALIDITY.num_seconds())
+    pub fn is_registered(&self) -> bool {
+        self.push_uuid.is_some()
     }
 }
 
@@ -210,6 +163,7 @@ impl Device {
                 .from_db()
         }}
     }
+
     pub async fn find_push_devices_by_user(user_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             devices::table
@@ -258,6 +212,9 @@ pub enum DeviceType {
     SafariExtension = 20,
     Sdk = 21,
     Server = 22,
+    WindowsCLI = 23,
+    MacOsCLI = 24,
+    LinuxCLI = 25,
 }
 
 impl fmt::Display for DeviceType {
@@ -269,23 +226,26 @@ impl fmt::Display for DeviceType {
             DeviceType::FirefoxExtension => write!(f, "Firefox Extension"),
             DeviceType::OperaExtension => write!(f, "Opera Extension"),
             DeviceType::EdgeExtension => write!(f, "Edge Extension"),
-            DeviceType::WindowsDesktop => write!(f, "Windows Desktop"),
-            DeviceType::MacOsDesktop => write!(f, "MacOS Desktop"),
-            DeviceType::LinuxDesktop => write!(f, "Linux Desktop"),
-            DeviceType::ChromeBrowser => write!(f, "Chrome Browser"),
-            DeviceType::FirefoxBrowser => write!(f, "Firefox Browser"),
-            DeviceType::OperaBrowser => write!(f, "Opera Browser"),
-            DeviceType::EdgeBrowser => write!(f, "Edge Browser"),
+            DeviceType::WindowsDesktop => write!(f, "Windows"),
+            DeviceType::MacOsDesktop => write!(f, "macOS"),
+            DeviceType::LinuxDesktop => write!(f, "Linux"),
+            DeviceType::ChromeBrowser => write!(f, "Chrome"),
+            DeviceType::FirefoxBrowser => write!(f, "Firefox"),
+            DeviceType::OperaBrowser => write!(f, "Opera"),
+            DeviceType::EdgeBrowser => write!(f, "Edge"),
             DeviceType::IEBrowser => write!(f, "Internet Explorer"),
             DeviceType::UnknownBrowser => write!(f, "Unknown Browser"),
-            DeviceType::AndroidAmazon => write!(f, "Android Amazon"),
+            DeviceType::AndroidAmazon => write!(f, "Android"),
             DeviceType::Uwp => write!(f, "UWP"),
-            DeviceType::SafariBrowser => write!(f, "Safari Browser"),
-            DeviceType::VivaldiBrowser => write!(f, "Vivaldi Browser"),
+            DeviceType::SafariBrowser => write!(f, "Safari"),
+            DeviceType::VivaldiBrowser => write!(f, "Vivaldi"),
             DeviceType::VivaldiExtension => write!(f, "Vivaldi Extension"),
             DeviceType::SafariExtension => write!(f, "Safari Extension"),
             DeviceType::Sdk => write!(f, "SDK"),
             DeviceType::Server => write!(f, "Server"),
+            DeviceType::WindowsCLI => write!(f, "Windows CLI"),
+            DeviceType::MacOsCLI => write!(f, "macOS CLI"),
+            DeviceType::LinuxCLI => write!(f, "Linux CLI"),
         }
     }
 }
@@ -316,6 +276,9 @@ impl DeviceType {
             20 => DeviceType::SafariExtension,
             21 => DeviceType::Sdk,
             22 => DeviceType::Server,
+            23 => DeviceType::WindowsCLI,
+            24 => DeviceType::MacOsCLI,
+            25 => DeviceType::LinuxCLI,
             _ => DeviceType::UnknownBrowser,
         }
     }

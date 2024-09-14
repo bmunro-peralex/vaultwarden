@@ -39,7 +39,6 @@ macro_rules! make_config {
 
         struct Inner {
             rocket_shutdown_handle: Option<rocket::Shutdown>,
-            ws_shutdown_handle: Option<tokio::sync::oneshot::Sender<()>>,
 
             templates: Handlebars<'static>,
             config: ConfigItems,
@@ -146,6 +145,12 @@ macro_rules! make_config {
 
                 config.signups_domains_whitelist = config.signups_domains_whitelist.trim().to_lowercase();
                 config.org_creation_users = config.org_creation_users.trim().to_lowercase();
+
+
+                // Copy the values from the deprecated flags to the new ones
+                if config.http_request_block_regex.is_none() {
+                    config.http_request_block_regex = config.icon_blacklist_regex.clone();
+                }
 
                 config
             }
@@ -361,7 +366,7 @@ make_config! {
         /// Sends folder
         sends_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "sends");
         /// Temp folder |> Used for storing temporary file uploads
-        tmp_folder:           String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
+        tmp_folder:             String, false,  auto,   |c| format!("{}/{}", c.data_folder, "tmp");
         /// Templates folder
         templates_folder:       String, false,  auto,   |c| format!("{}/{}", c.data_folder, "templates");
         /// Session JWT key
@@ -371,11 +376,7 @@ make_config! {
     },
     ws {
         /// Enable websocket notifications
-        websocket_enabled:      bool,   false,  def,    false;
-        /// Websocket address
-        websocket_address:      String, false,  def,    "0.0.0.0".to_string();
-        /// Websocket port
-        websocket_port:         u16,    false,  def,    3012;
+        enable_websocket:       bool,   false,  def,    true;
     },
     push {
         /// Enable push notifications
@@ -414,7 +415,12 @@ make_config! {
         /// Auth Request cleanup schedule |> Cron schedule of the job that cleans old auth requests from the auth request.
         /// Defaults to every minute. Set blank to disable this job.
         auth_request_purge_schedule:   String, false,  def,    "30 * * * * *".to_string();
-
+        /// Duo Auth context cleanup schedule |> Cron schedule of the job that cleans expired Duo contexts from the database. Does nothing if Duo MFA is disabled or set to use the legacy iframe prompt.
+        /// Defaults to once every minute. Set blank to disable this job.
+        duo_context_purge_schedule:   String, false,  def,    "30 * * * * *".to_string();
+        /// Purge incomplete sso nonce. |> Cron schedule of the job that cleans leftover nonce in db due to incomplete sso login.
+        /// Defaults to daily. Set blank to disable this job.
+        purge_incomplete_sso_nonce: String, false,  def,   "0 20 0 * * *".to_string();
     },
 
     /// General settings
@@ -442,6 +448,8 @@ make_config! {
         user_attachment_limit:  i64,    true,   option;
         /// Per-organization attachment storage limit (KB) |> Max kilobytes of attachment storage allowed per org. When this limit is reached, org members will not be allowed to upload further attachments for ciphers owned by that org.
         org_attachment_limit:   i64,    true,   option;
+        /// Per-user send storage limit (KB) |> Max kilobytes of sends storage allowed per user. When this limit is reached, the user will not be allowed to upload further sends.
+        user_send_limit:   i64,    true,   option;
 
         /// Trash auto-delete days |> Number of days to wait before auto-deleting a trashed item.
         /// If unset, trashed items are not auto-deleted. This setting applies globally, so make
@@ -534,12 +542,18 @@ make_config! {
         icon_cache_negttl:      u64,    true,   def,    259_200;
         /// Icon download timeout |> Number of seconds when to stop attempting to download an icon.
         icon_download_timeout:  u64,    true,   def,    10;
-        /// Icon blacklist Regex |> Any domains or IPs that match this regex won't be fetched by the icon service.
+
+        /// [Deprecated] Icon blacklist Regex |> Use `http_request_block_regex` instead
+        icon_blacklist_regex:   String, false,   option;
+        /// [Deprecated] Icon blacklist non global IPs |> Use `http_request_block_non_global_ips` instead
+        icon_blacklist_non_global_ips:  bool,   false,   def, true;
+
+        /// Block HTTP domains/IPs by Regex |> Any domains or IPs that match this regex won't be fetched by the internal HTTP client.
         /// Useful to hide other servers in the local network. Check the WIKI for more details
-        icon_blacklist_regex:   String, true,   option;
-        /// Icon blacklist non global IPs |> Any IP which is not defined as a global IP will be blacklisted.
+        http_request_block_regex:   String, true,   option;
+        /// Block non global IPs |> Enabling this will cause the internal HTTP client to refuse to connect to any non global IP address.
         /// Useful to secure your internal environment: See https://en.wikipedia.org/wiki/Reserved_IP_addresses for a list of IPs which it will block
-        icon_blacklist_non_global_ips:  bool,   true,   def,    true;
+        http_request_block_non_global_ips:  bool,   true,   auto, |c| c.icon_blacklist_non_global_ips;
 
         /// Disable Two-Factor remember |> Enabling this would force the users to use a second factor to login every time.
         /// Note that the checkbox would still be present, but ignored.
@@ -567,8 +581,9 @@ make_config! {
         use_syslog:             bool,   false,  def,    false;
         /// Log file path
         log_file:               String, false,  option;
-        /// Log level
-        log_level:              String, false,  def,    "Info".to_string();
+        /// Log level |> Valid values are "trace", "debug", "info", "warn", "error" and "off"
+        /// For a specific module append it as a comma separated value "info,path::to::module=debug"
+        log_level:              String, false,  def,    "info".to_string();
 
         /// Enable DB WAL |> Turning this off might lead to worse performance, but might help if using vaultwarden on some exotic filesystems,
         /// that do not support WAL. Please make sure you read project wiki on the topic before changing this setting.
@@ -606,7 +621,52 @@ make_config! {
         admin_session_lifetime:        i64, true,  def, 20;
 
         /// Enable groups (BETA!) (Know the risks!) |> Enables groups support for organizations (Currently contains known issues!).
-        org_groups_enabled:     bool,   false,  def,    false;
+        org_groups_enabled:            bool, false, def, false;
+
+        /// Increase note size limit (Know the risks!) |> Sets the secure note size limit to 100_000 instead of the default 10_000.
+        /// WARNING: This could cause issues with clients. Also exports will not work on Bitwarden servers!
+        increase_note_size_limit:      bool,  true,  def, false;
+        /// Generated max_note_size value to prevent if..else matching during every check
+        _max_note_size:                usize, false, gen, |c| if c.increase_note_size_limit {100_000} else {10_000};
+
+        /// Enforce Single Org with Reset Password Policy |> Enforce that the Single Org policy is enabled before setting the Reset Password policy
+        /// Bitwarden enforces this by default. In Vaultwarden we encouraged to use multiple organizations because groups were not available.
+        /// Setting this to true will enforce the Single Org Policy to be enabled before you can enable the Reset Password policy.
+        enforce_single_org_with_reset_pw_policy: bool, false, def, false;
+    },
+
+    /// OpenID Connect SSO settings
+    sso {
+        /// Enabled
+        sso_enabled:                    bool,   false,   def,    false;
+        /// Only sso login |> Disable Email+Master Password login
+        sso_only:                       bool,   true,   def,    false;
+        /// Allow email associtation |> Associate existing non-sso user based on email
+        sso_signups_match_email:        bool,   true,   def,    true;
+        /// Client ID
+        sso_client_id:                  String, false,   def,    String::new();
+        /// Client Key
+        sso_client_secret:              Pass,   false,   def,    String::new();
+        /// Authority Server |> Base url of the OIDC provider discovery endpoint (without `/.well-known/openid-configuration`)
+        sso_authority:                  String, false,   def,    String::new();
+        /// Authorization request scopes |> List the of the needed scope (`openid` is implicit)
+        sso_scopes:                     String, false,  def,   "email profile".to_string();
+        /// Authorization request extra parameters
+        sso_authorize_extra_params:     String, false,  def,    String::new();
+        /// Use PKCE during Authorization flow
+        sso_pkce:                       bool,   false,   def,    false;
+        /// Regex for additionnal trusted Id token audience |> By default only the client_id is trsuted.
+        sso_audience_trusted:           String, false,  option;
+        /// CallBack Path |> Generated from Domain.
+        sso_callback_path:              String, false,  gen,    |c| generate_sso_callback_path(&c.domain);
+        /// Optional sso master password policy |> Ex format: '{"enforceOnLogin":false,"minComplexity":3,"minLength":12,"requireLower":false,"requireNumbers":false,"requireSpecial":false,"requireUpper":false}'
+        sso_master_password_policy:     String, true,  option;
+        /// Use sso only for auth not the session lifecycle |> Use default Vaultwarden session lifecycle (Idle refresh token valid for 30days)
+        sso_auth_only_not_session:      bool,   true,   def,    false;
+        /// Client cache for discovery endpoint. |> Duration in seconds (0 or less to disable). More details: https://github.com/dani-garcia/vaultwarden/blob/sso-support/SSO.md#client-cache
+        sso_client_cache_expiration:    u64,    true,   def,    0;
+        /// Log all tokens |> `LOG_LEVEL=debug` or `LOG_LEVEL=info,vaultwarden::sso=debug` is required
+        sso_debug_tokens:               bool,   true,   def,    false;
     },
 
     /// Yubikey settings
@@ -625,6 +685,8 @@ make_config! {
     duo: _enable_duo {
         /// Enabled
         _enable_duo:            bool,   true,   def,     true;
+        /// Attempt to use deprecated iframe-based Traditional Prompt (Duo WebSDK 2)
+        duo_use_iframe:         bool,   false,  def,     false;
         /// Integration Key
         duo_ikey:               String, true,   option;
         /// Secret Key
@@ -689,6 +751,10 @@ make_config! {
         email_expiration_time:  u64,    true,   def,      600;
         /// Maximum attempts |> Maximum attempts before an email token is reset and a new email will need to be sent
         email_attempts_limit:   u64,    true,   def,      3;
+        /// Automatically enforce at login |> Setup email 2FA provider regardless of any organization policy
+        email_2fa_enforce_on_verified_invite: bool,   true,   def,      false;
+        /// Auto-enable 2FA (Know the risks!) |> Automatically setup email 2FA as fallback provider when needed
+        email_2fa_auto_fallback: bool,  true,   def,      false;
     },
 }
 
@@ -776,11 +842,34 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         }
     }
 
+    // TODO: deal with deprecated flags so they can be removed from this list, cf. #4263
     const KNOWN_FLAGS: &[&str] =
         &["autofill-overlay", "autofill-v2", "browser-fileless-import", "fido2-vault-credentials"];
-    for flag in parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags).keys() {
-        if !KNOWN_FLAGS.contains(&flag.as_str()) {
-            warn!("The experimental client feature flag {flag:?} is unrecognized. Please ensure the feature flag is spelled correctly and that it is supported in this version.");
+    let configured_flags = parse_experimental_client_feature_flags(&cfg.experimental_client_feature_flags);
+    let invalid_flags: Vec<_> = configured_flags.keys().filter(|flag| !KNOWN_FLAGS.contains(&flag.as_str())).collect();
+    if !invalid_flags.is_empty() {
+        err!(format!("Unrecognized experimental client feature flags: {invalid_flags:?}.\n\n\
+                     Please ensure all feature flags are spelled correctly and that they are supported in this version.\n\
+                     Supported flags: {KNOWN_FLAGS:?}"));
+    }
+
+    const MAX_FILESIZE_KB: i64 = i64::MAX >> 10;
+
+    if let Some(limit) = cfg.user_attachment_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`USER_ATTACHMENT_LIMIT` is out of bounds");
+        }
+    }
+
+    if let Some(limit) = cfg.org_attachment_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`ORG_ATTACHMENT_LIMIT` is out of bounds");
+        }
+    }
+
+    if let Some(limit) = cfg.user_send_limit {
+        if !(0i64..=MAX_FILESIZE_KB).contains(&limit) {
+            err!("`USER_SEND_LIMIT` is out of bounds");
         }
     }
 
@@ -789,6 +878,17 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         && !(cfg.duo_host.is_some() && cfg.duo_ikey.is_some() && cfg.duo_skey.is_some())
     {
         err!("All Duo options need to be set for global Duo support")
+    }
+
+    if cfg.sso_enabled {
+        if cfg.sso_client_id.is_empty() || cfg.sso_client_secret.is_empty() || cfg.sso_authority.is_empty() {
+            err!("`SSO_CLIENT_ID`, `SSO_CLIENT_SECRET` and `SSO_AUTHORITY` must be set for SSO support")
+        }
+
+        internal_sso_issuer_url(&cfg.sso_authority)?;
+        internal_sso_redirect_url(&cfg.sso_callback_path)?;
+        check_master_password_policy(&cfg.sso_master_password_policy)?;
+        internal_sso_authorize_extra_params_vec(&cfg.sso_authorize_extra_params)?;
     }
 
     if cfg._enable_yubico {
@@ -868,12 +968,19 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
         err!("To enable email 2FA, a mail transport must be configured")
     }
 
-    // Check if the icon blacklist regex is valid
-    if let Some(ref r) = cfg.icon_blacklist_regex {
+    if !cfg._enable_email_2fa && cfg.email_2fa_enforce_on_verified_invite {
+        err!("To enforce email 2FA on verified invitations, email 2fa has to be enabled!");
+    }
+    if !cfg._enable_email_2fa && cfg.email_2fa_auto_fallback {
+        err!("To use email 2FA as automatic fallback, email 2fa has to be enabled!");
+    }
+
+    // Check if the HTTP request block regex is valid
+    if let Some(ref r) = cfg.http_request_block_regex {
         let validate_regex = regex::Regex::new(r);
         match validate_regex {
             Ok(_) => (),
-            Err(e) => err!(format!("`ICON_BLACKLIST_REGEX` is invalid: {e:#?}")),
+            Err(e) => err!(format!("`HTTP_REQUEST_BLOCK_REGEX` is invalid: {e:#?}")),
         }
     }
 
@@ -953,6 +1060,40 @@ fn validate_config(cfg: &ConfigItems) -> Result<(), Error> {
             _ => {}
         }
     }
+
+    if cfg.increase_note_size_limit {
+        println!("[WARNING] Secure Note size limit is increased to 100_000!");
+        println!("[WARNING] This could cause issues with clients. Also exports will not work on Bitwarden servers!.");
+    }
+    Ok(())
+}
+
+fn internal_sso_issuer_url(sso_authority: &String) -> Result<openidconnect::IssuerUrl, Error> {
+    match openidconnect::IssuerUrl::new(sso_authority.clone()) {
+        Err(err) => err!(format!("Invalid sso_authority UR ({sso_authority}): {err}")),
+        Ok(issuer_url) => Ok(issuer_url),
+    }
+}
+
+fn internal_sso_redirect_url(sso_callback_path: &String) -> Result<openidconnect::RedirectUrl, Error> {
+    match openidconnect::RedirectUrl::new(sso_callback_path.clone()) {
+        Err(err) => err!(format!("Invalid sso_callback_path ({sso_callback_path} built using `domain`) URL: {err}")),
+        Ok(redirect_url) => Ok(redirect_url),
+    }
+}
+
+fn internal_sso_authorize_extra_params_vec(config: &str) -> Result<Vec<(String, String)>, Error> {
+    match parse_param_list(config.to_owned(), '&', '=') {
+        Err(e) => err!(format!("Invalid SSO_AUTHORIZE_EXTRA_PARAMS: {e}")),
+        Ok(params) => Ok(params),
+    }
+}
+
+fn check_master_password_policy(sso_master_password_policy: &Option<String>) -> Result<(), Error> {
+    let policy = sso_master_password_policy.as_ref().map(|mpp| serde_json::from_str::<serde_json::Value>(mpp));
+    if let Some(Err(error)) = policy {
+        err!(format!("Invalid sso_master_password_policy ({error}), Ensure that it's correctly escaped with ''"))
+    }
     Ok(())
 }
 
@@ -985,6 +1126,10 @@ fn generate_smtp_img_src(embed_images: bool, domain: &str) -> String {
     } else {
         format!("{domain}/vw_static/")
     }
+}
+
+fn generate_sso_callback_path(domain: &str) -> String {
+    format!("{domain}/identity/connect/oidc-signin")
 }
 
 /// Generate the correct URL for the icon service.
@@ -1029,6 +1174,26 @@ fn smtp_convert_deprecated_ssl_options(smtp_ssl: Option<bool>, smtp_explicit_tls
     "starttls".to_string()
 }
 
+/// Allow to parse a list of Key/Values (Ex: `key1=value&key2=value2`)
+/// - line break are handled as `separator`
+fn parse_param_list(config: String, separator: char, kv_separator: char) -> Result<Vec<(String, String)>, Error> {
+    config
+        .lines()
+        .flat_map(|l| l.split(separator))
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let split = l.split(kv_separator).collect::<Vec<&str>>();
+            match &split[..] {
+                [key, value] => Ok(((*key).to_string(), (*value).to_string())),
+                _ => {
+                    err!(format!("Failed to parse ({l}). Expected key{kv_separator}value"))
+                }
+            }
+        })
+        .collect()
+}
+
 impl Config {
     pub fn load() -> Result<Self, Error> {
         // Loading from env and file
@@ -1046,7 +1211,6 @@ impl Config {
         Ok(Config {
             inner: RwLock::new(Inner {
                 rocket_shutdown_handle: None,
-                ws_shutdown_handle: None,
                 templates: load_templates(&config.templates_folder),
                 config,
                 _env,
@@ -1139,7 +1303,7 @@ impl Config {
     }
 
     pub fn delete_user_config(&self) -> Result<(), Error> {
-        crate::util::delete_file(&CONFIG_FILE)?;
+        std::fs::remove_file(&*CONFIG_FILE)?;
 
         // Empty user config
         let usr = ConfigBuilder::default();
@@ -1163,9 +1327,6 @@ impl Config {
 
     pub fn private_rsa_key(&self) -> String {
         format!("{}.pem", CONFIG.rsa_key_filename())
-    }
-    pub fn public_rsa_key(&self) -> String {
-        format!("{}.pub.pem", CONFIG.rsa_key_filename())
     }
     pub fn mail_enabled(&self) -> bool {
         let inner = &self.inner.read().unwrap().config;
@@ -1215,20 +1376,28 @@ impl Config {
         self.inner.write().unwrap().rocket_shutdown_handle = Some(handle);
     }
 
-    pub fn set_ws_shutdown_handle(&self, handle: tokio::sync::oneshot::Sender<()>) {
-        self.inner.write().unwrap().ws_shutdown_handle = Some(handle);
-    }
-
     pub fn shutdown(&self) {
         if let Ok(mut c) = self.inner.write() {
-            if let Some(handle) = c.ws_shutdown_handle.take() {
-                handle.send(()).ok();
-            }
-
             if let Some(handle) = c.rocket_shutdown_handle.take() {
                 handle.notify();
             }
         }
+    }
+
+    pub fn sso_issuer_url(&self) -> Result<openidconnect::IssuerUrl, Error> {
+        internal_sso_issuer_url(&self.sso_authority())
+    }
+
+    pub fn sso_redirect_url(&self) -> Result<openidconnect::RedirectUrl, Error> {
+        internal_sso_redirect_url(&self.sso_callback_path())
+    }
+
+    pub fn sso_scopes_vec(&self) -> Vec<String> {
+        self.sso_scopes().split_whitespace().map(str::to_string).collect()
+    }
+
+    pub fn sso_authorize_extra_params_vec(&self) -> Result<Vec<(String, String)>, Error> {
+        internal_sso_authorize_extra_params_vec(&self.sso_authorize_extra_params())
     }
 }
 
@@ -1246,7 +1415,6 @@ where
     hb.set_strict_mode(true);
     // Register helpers
     hb.register_helper("case", Box::new(case_helper));
-    hb.register_helper("jsesc", Box::new(js_escape_helper));
     hb.register_helper("to_json", Box::new(to_json));
 
     macro_rules! reg {
@@ -1286,7 +1454,9 @@ where
     reg!("email/send_emergency_access_invite", ".html");
     reg!("email/send_org_invite", ".html");
     reg!("email/send_single_org_removed_from_org", ".html");
+    reg!("email/set_password", ".html");
     reg!("email/smtp_test", ".html");
+    reg!("email/sso_change_email", ".html");
     reg!("email/twofactor_email", ".html");
     reg!("email/verify_email", ".html");
     reg!("email/welcome_must_verify", ".html");
@@ -1304,14 +1474,7 @@ where
     // And then load user templates to overwrite the defaults
     // Use .hbs extension for the files
     // Templates get registered with their relative name
-    hb.register_templates_directory(
-        path,
-        DirectorySourceOptions {
-            tpl_extension: ".hbs".to_owned(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    hb.register_templates_directory(path, DirectorySourceOptions::default()).unwrap();
 
     hb
 }
@@ -1334,32 +1497,6 @@ fn case_helper<'reg, 'rc>(
     }
 }
 
-fn js_escape_helper<'reg, 'rc>(
-    h: &Helper<'rc>,
-    _r: &'reg Handlebars<'_>,
-    _ctx: &'rc Context,
-    _rc: &mut RenderContext<'reg, 'rc>,
-    out: &mut dyn Output,
-) -> HelperResult {
-    let param =
-        h.param(0).ok_or_else(|| RenderErrorReason::Other(String::from("Param not found for helper \"jsesc\"")))?;
-
-    let no_quote = h.param(1).is_some();
-
-    let value = param
-        .value()
-        .as_str()
-        .ok_or_else(|| RenderErrorReason::Other(String::from("Param for helper \"jsesc\" is not a String")))?;
-
-    let mut escaped_value = value.replace('\\', "").replace('\'', "\\x22").replace('\"', "\\x27");
-    if !no_quote {
-        escaped_value = format!("&quot;{escaped_value}&quot;");
-    }
-
-    out.write(&escaped_value)?;
-    Ok(())
-}
-
 fn to_json<'reg, 'rc>(
     h: &Helper<'rc>,
     _r: &'reg Handlebars<'_>,
@@ -1375,4 +1512,55 @@ fn to_json<'reg, 'rc>(
         .map_err(|e| RenderErrorReason::Other(format!("Can't serialize parameter to JSON: {e}")))?;
     out.write(&json)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_param_list() {
+        let config = "key1=value&key2=value2&".to_string();
+        let parsed = parse_param_list(config, '&', '=');
+
+        assert_eq!(
+            parsed.unwrap(),
+            vec![("key1".to_string(), "value".to_string()), ("key2".to_string(), "value2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_param_list_lines() {
+        let config = r#"
+        key1=value
+        key2=value2
+        "#
+        .to_string();
+        let parsed = parse_param_list(config, '&', '=');
+
+        assert_eq!(
+            parsed.unwrap(),
+            vec![("key1".to_string(), "value".to_string()), ("key2".to_string(), "value2".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_parse_param_list_mixed() {
+        let config = r#"key1=value&key2=value2&
+        &key3=value3&&
+        &key4=value4
+        "#
+        .to_string();
+        let parsed = parse_param_list(config, '&', '=');
+
+        assert_eq!(
+            parsed.unwrap(),
+            vec![
+                ("key1".to_string(), "value".to_string()),
+                ("key2".to_string(), "value2".to_string()),
+                ("key3".to_string(), "value3".to_string()),
+                ("key4".to_string(), "value4".to_string()),
+            ]
+        );
+    }
 }

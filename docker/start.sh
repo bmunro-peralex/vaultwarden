@@ -1,5 +1,9 @@
 #!/bin/sh
 
+if [ -n "${UMASK}" ]; then
+    umask "${UMASK}"
+fi
+
 if [ -r /etc/vaultwarden.sh ]; then
     . /etc/vaultwarden.sh
 elif [ -r /etc/bitwarden_rs.sh ]; then
@@ -20,6 +24,13 @@ elif [ -d /etc/bitwarden_rs.d ]; then
             . "${f}"
         fi
     done
+fi
+
+# Toggle the SSO Link
+if [ "$SSO_ENABLED" = "true" ]; then
+    sed -i 's#a\[routerlink="/sso"\]#a\[routerlink="/sso-sed"\]#' /web-vault/app/main.*.css
+else
+    sed -i 's#a\[routerlink="/sso-sed"\]#a\[routerlink="/sso"\]#' /web-vault/app/main.*.css
 fi
 
 exec /vaultwarden "${@}"

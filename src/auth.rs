@@ -1,18 +1,35 @@
 // JWT Handling
-//
-use chrono::{Duration, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use jsonwebtoken::{errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header};
 use num_traits::FromPrimitive;
-use once_cell::sync::Lazy;
-
-use jsonwebtoken::{self, errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header};
+use once_cell::sync::{Lazy, OnceCell};
+use openssl::rsa::Rsa;
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
+use std::{
+    env,
+    fs::File,
+    io::{Read, Write},
+    net::IpAddr,
+};
 
-use crate::{error::Error, CONFIG};
+use crate::{
+    api::ApiResult,
+    db::{
+        models::{Collection, Device, User, UserOrgStatus, UserOrgType, UserOrganization, UserStampException},
+        DbConn,
+    },
+    error::Error,
+    sso, CONFIG,
+};
 
 const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
-pub static DEFAULT_VALIDITY: Lazy<Duration> = Lazy::new(|| Duration::hours(2));
+// Limit when BitWarden consider the token as expired
+pub static BW_EXPIRATION: Lazy<TimeDelta> = Lazy::new(|| TimeDelta::try_minutes(5).unwrap());
+
+pub static DEFAULT_REFRESH_VALIDITY: Lazy<TimeDelta> = Lazy::new(|| TimeDelta::try_days(30).unwrap());
+pub static DEFAULT_ACCESS_VALIDITY: Lazy<TimeDelta> = Lazy::new(|| TimeDelta::try_hours(2).unwrap());
 static JWT_HEADER: Lazy<Header> = Lazy::new(|| Header::new(JWT_ALGORITHM));
 
 pub static JWT_LOGIN_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|login", CONFIG.domain_origin()));
@@ -26,29 +43,61 @@ static JWT_SEND_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|send", CONFIG.do
 static JWT_ORG_API_KEY_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|api.organization", CONFIG.domain_origin()));
 static JWT_FILE_DOWNLOAD_ISSUER: Lazy<String> = Lazy::new(|| format!("{}|file_download", CONFIG.domain_origin()));
 
-static PRIVATE_RSA_KEY: Lazy<EncodingKey> = Lazy::new(|| {
-    let key =
-        std::fs::read(CONFIG.private_rsa_key()).unwrap_or_else(|e| panic!("Error loading private RSA Key. \n{e}"));
-    EncodingKey::from_rsa_pem(&key).unwrap_or_else(|e| panic!("Error decoding private RSA Key.\n{e}"))
-});
-static PUBLIC_RSA_KEY: Lazy<DecodingKey> = Lazy::new(|| {
-    let key = std::fs::read(CONFIG.public_rsa_key()).unwrap_or_else(|e| panic!("Error loading public RSA Key. \n{e}"));
-    DecodingKey::from_rsa_pem(&key).unwrap_or_else(|e| panic!("Error decoding public RSA Key.\n{e}"))
-});
+static PRIVATE_RSA_KEY: OnceCell<EncodingKey> = OnceCell::new();
+static PUBLIC_RSA_KEY: OnceCell<DecodingKey> = OnceCell::new();
 
-pub fn load_keys() {
-    Lazy::force(&PRIVATE_RSA_KEY);
-    Lazy::force(&PUBLIC_RSA_KEY);
+pub fn initialize_keys() -> Result<(), crate::error::Error> {
+    fn read_key(create_if_missing: bool) -> Result<(Rsa<openssl::pkey::Private>, Vec<u8>), crate::error::Error> {
+        let mut priv_key_buffer = Vec::with_capacity(2048);
+
+        let mut priv_key_file = File::options()
+            .create(create_if_missing)
+            .truncate(false)
+            .read(true)
+            .write(create_if_missing)
+            .open(CONFIG.private_rsa_key())?;
+
+        #[allow(clippy::verbose_file_reads)]
+        let bytes_read = priv_key_file.read_to_end(&mut priv_key_buffer)?;
+
+        let rsa_key = if bytes_read > 0 {
+            Rsa::private_key_from_pem(&priv_key_buffer[..bytes_read])?
+        } else if create_if_missing {
+            // Only create the key if the file doesn't exist or is empty
+            let rsa_key = openssl::rsa::Rsa::generate(2048)?;
+            priv_key_buffer = rsa_key.private_key_to_pem()?;
+            priv_key_file.write_all(&priv_key_buffer)?;
+            info!("Private key '{}' created correctly", CONFIG.private_rsa_key());
+            rsa_key
+        } else {
+            err!("Private key does not exist or invalid format", CONFIG.private_rsa_key());
+        };
+
+        Ok((rsa_key, priv_key_buffer))
+    }
+
+    let (priv_key, priv_key_buffer) = read_key(true).or_else(|_| read_key(false))?;
+    let pub_key_buffer = priv_key.public_key_to_pem()?;
+
+    let enc = EncodingKey::from_rsa_pem(&priv_key_buffer)?;
+    let dec: DecodingKey = DecodingKey::from_rsa_pem(&pub_key_buffer)?;
+    if PRIVATE_RSA_KEY.set(enc).is_err() {
+        err!("PRIVATE_RSA_KEY must only be initialized once")
+    }
+    if PUBLIC_RSA_KEY.set(dec).is_err() {
+        err!("PUBLIC_RSA_KEY must only be initialized once")
+    }
+    Ok(())
 }
 
 pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
-    match jsonwebtoken::encode(&JWT_HEADER, claims, &PRIVATE_RSA_KEY) {
+    match jsonwebtoken::encode(&JWT_HEADER, claims, PRIVATE_RSA_KEY.wait()) {
         Ok(token) => token,
         Err(e) => panic!("Error encoding jwt {e}"),
     }
 }
 
-fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Error> {
+pub fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Error> {
     let mut validation = jsonwebtoken::Validation::new(JWT_ALGORITHM);
     validation.leeway = 30; // 30 seconds
     validation.validate_exp = true;
@@ -56,7 +105,7 @@ fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Err
     validation.set_issuer(&[issuer]);
 
     let token = token.replace(char::is_whitespace, "");
-    match jsonwebtoken::decode(&token, &PUBLIC_RSA_KEY, &validation) {
+    match jsonwebtoken::decode(&token, PUBLIC_RSA_KEY.wait(), &validation) {
         Ok(d) => Ok(d.claims),
         Err(err) => match *err.kind() {
             ErrorKind::InvalidToken => err!("Token is invalid"),
@@ -65,6 +114,10 @@ fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Err
             _ => err!("Error decoding JWT"),
         },
     }
+}
+
+pub fn decode_refresh(token: &str) -> Result<RefreshJwtClaims, Error> {
+    decode_jwt(token, JWT_LOGIN_ISSUER.to_string())
 }
 
 pub fn decode_login(token: &str) -> Result<LoginJwtClaims, Error> {
@@ -140,6 +193,73 @@ pub struct LoginJwtClaims {
     pub amr: Vec<String>,
 }
 
+impl LoginJwtClaims {
+    pub fn new(device: &Device, user: &User, nbf: i64, exp: i64, scope: Vec<String>, now: DateTime<Utc>) -> Self {
+        // ---
+        // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+        // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+        // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+        // ---
+        // fn arg: orgs: Vec<super::UserOrganization>,
+        // ---
+        // let orgowner: Vec<_> = orgs.iter().filter(|o| o.atype == 0).map(|o| o.org_uuid.clone()).collect();
+        // let orgadmin: Vec<_> = orgs.iter().filter(|o| o.atype == 1).map(|o| o.org_uuid.clone()).collect();
+        // let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
+        // let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
+
+        if exp <= (now + *BW_EXPIRATION).timestamp() {
+            warn!("Raise access_token lifetime to more than 5min.")
+        }
+
+        // Create the JWT claims struct, to send to the client
+        Self {
+            nbf,
+            exp,
+            iss: JWT_LOGIN_ISSUER.to_string(),
+            sub: user.uuid.clone(),
+            premium: true,
+            name: user.name.clone(),
+            email: user.email.clone(),
+            email_verified: !CONFIG.mail_enabled() || user.verified_at.is_some(),
+
+            // ---
+            // Disabled these keys to be added to the JWT since they could cause the JWT to get too large
+            // Also These key/value pairs are not used anywhere by either Vaultwarden or Bitwarden Clients
+            // Because these might get used in the future, and they are added by the Bitwarden Server, lets keep it, but then commented out
+            // See: https://github.com/dani-garcia/vaultwarden/issues/4156
+            // ---
+            // orgowner,
+            // orgadmin,
+            // orguser,
+            // orgmanager,
+            sstamp: user.security_stamp.clone(),
+            device: device.uuid.clone(),
+            scope,
+            amr: vec!["Application".into()],
+        }
+    }
+
+    pub fn default(device: &Device, user: &User, auth_method: &AuthMethod) -> Self {
+        let time_now = Utc::now();
+        Self::new(
+            device,
+            user,
+            time_now.timestamp(),
+            (time_now + *DEFAULT_ACCESS_VALIDITY).timestamp(),
+            auth_method.scope_vec(),
+            time_now,
+        )
+    }
+
+    pub fn token(&self) -> String {
+        encode_jwt(&self)
+    }
+
+    pub fn expires_in(&self) -> i64 {
+        self.exp - Utc::now().timestamp()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InviteJwtClaims {
     // Not before
@@ -164,11 +284,11 @@ pub fn generate_invite_claims(
     user_org_id: Option<String>,
     invited_by_email: Option<String>,
 ) -> InviteJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     InviteJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
+        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
         iss: JWT_INVITE_ISSUER.to_string(),
         sub: uuid,
         email,
@@ -202,11 +322,11 @@ pub fn generate_emergency_access_invite_claims(
     grantor_name: String,
     grantor_email: String,
 ) -> EmergencyAccessInviteJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     EmergencyAccessInviteJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
+        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
         iss: JWT_EMERGENCY_ACCESS_INVITE_ISSUER.to_string(),
         sub: uuid,
         email,
@@ -233,10 +353,10 @@ pub struct OrgApiKeyLoginJwtClaims {
 }
 
 pub fn generate_organization_api_key_login_claims(uuid: String, org_id: String) -> OrgApiKeyLoginJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     OrgApiKeyLoginJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::hours(1)).timestamp(),
+        exp: (time_now + TimeDelta::try_hours(1).unwrap()).timestamp(),
         iss: JWT_ORG_API_KEY_ISSUER.to_string(),
         sub: uuid,
         client_id: format!("organization.{org_id}"),
@@ -260,10 +380,10 @@ pub struct FileDownloadClaims {
 }
 
 pub fn generate_file_download_claims(uuid: String, file_id: String) -> FileDownloadClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     FileDownloadClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::minutes(5)).timestamp(),
+        exp: (time_now + TimeDelta::try_minutes(5).unwrap()).timestamp(),
         iss: JWT_FILE_DOWNLOAD_ISSUER.to_string(),
         sub: uuid,
         file_id,
@@ -283,42 +403,42 @@ pub struct BasicJwtClaims {
 }
 
 pub fn generate_delete_claims(uuid: String) -> BasicJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
+        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
         iss: JWT_DELETE_ISSUER.to_string(),
         sub: uuid,
     }
 }
 
 pub fn generate_verify_email_claims(uuid: String) -> BasicJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     let expire_hours = i64::from(CONFIG.invitation_expiration_hours());
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::hours(expire_hours)).timestamp(),
+        exp: (time_now + TimeDelta::try_hours(expire_hours).unwrap()).timestamp(),
         iss: JWT_VERIFYEMAIL_ISSUER.to_string(),
         sub: uuid,
     }
 }
 
 pub fn generate_admin_claims() -> BasicJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::minutes(CONFIG.admin_session_lifetime())).timestamp(),
+        exp: (time_now + TimeDelta::try_minutes(CONFIG.admin_session_lifetime()).unwrap()).timestamp(),
         iss: JWT_ADMIN_ISSUER.to_string(),
         sub: "admin_panel".to_string(),
     }
 }
 
 pub fn generate_send_claims(send_id: &str, file_id: &str) -> BasicJwtClaims {
-    let time_now = Utc::now().naive_utc();
+    let time_now = Utc::now();
     BasicJwtClaims {
         nbf: time_now.timestamp(),
-        exp: (time_now + Duration::minutes(2)).timestamp(),
+        exp: (time_now + TimeDelta::try_minutes(2).unwrap()).timestamp(),
         iss: JWT_SEND_ISSUER.to_string(),
         sub: format!("{send_id}/{file_id}"),
     }
@@ -330,11 +450,6 @@ pub fn generate_send_claims(send_id: &str, file_id: &str) -> BasicJwtClaims {
 use rocket::{
     outcome::try_outcome,
     request::{FromRequest, Outcome, Request},
-};
-
-use crate::db::{
-    models::{Collection, Device, User, UserOrgStatus, UserOrgType, UserOrganization, UserStampException},
-    DbConn,
 };
 
 pub struct Host {
@@ -355,8 +470,6 @@ impl<'r> FromRequest<'r> for Host {
             referer.to_string()
         } else {
             // Try to guess from the headers
-            use std::env;
-
             let protocol = if let Some(proto) = headers.get_one("X-Forwarded-Proto") {
                 proto
             } else if env::var("ROCKET_TLS").is_ok() {
@@ -367,10 +480,8 @@ impl<'r> FromRequest<'r> for Host {
 
             let host = if let Some(host) = headers.get_one("X-Forwarded-Host") {
                 host
-            } else if let Some(host) = headers.get_one("Host") {
-                host
             } else {
-                ""
+                headers.get_one("Host").unwrap_or_default()
             };
 
             format!("{protocol}://{host}")
@@ -383,7 +494,6 @@ impl<'r> FromRequest<'r> for Host {
 }
 
 pub struct ClientHeaders {
-    pub host: String,
     pub device_type: i32,
     pub ip: ClientIp,
 }
@@ -393,7 +503,6 @@ impl<'r> FromRequest<'r> for ClientHeaders {
     type Error = &'static str;
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
-        let host = try_outcome!(Host::from_request(request).await).host;
         let ip = match ClientIp::from_request(request).await {
             Outcome::Success(ip) => ip,
             _ => err_handler!("Error getting Client IP"),
@@ -403,7 +512,6 @@ impl<'r> FromRequest<'r> for ClientHeaders {
             request.headers().get_one("device-type").map(|d| d.parse().unwrap_or(14)).unwrap_or_else(|| 14);
 
         Outcome::Success(ClientHeaders {
-            host,
             device_type,
             ip,
         })
@@ -475,7 +583,7 @@ impl<'r> FromRequest<'r> for Headers {
                 // Check if the stamp exception has expired first.
                 // Then, check if the current route matches any of the allowed routes.
                 // After that check the stamp in exception matches the one in the claims.
-                if Utc::now().naive_utc().timestamp() > stamp_exception.expire {
+                if Utc::now().timestamp() > stamp_exception.expire {
                     // If the stamp exception has been expired remove it from the database.
                     // This prevents checking this stamp exception for new requests.
                     let mut user = user;
@@ -509,7 +617,6 @@ pub struct OrgHeaders {
     pub user: User,
     pub org_user_type: UserOrgType,
     pub org_user: UserOrganization,
-    pub org_id: String,
     pub ip: ClientIp,
 }
 
@@ -572,7 +679,6 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                         }
                     },
                     org_user,
-                    org_id: String::from(org_id),
                     ip: headers.ip,
                 })
             }
@@ -649,7 +755,6 @@ pub struct ManagerHeaders {
     pub host: String,
     pub device: Device,
     pub user: User,
-    pub org_user_type: UserOrgType,
     pub ip: ClientIp,
 }
 
@@ -667,7 +772,7 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                         _ => err_handler!("Error getting DB"),
                     };
 
-                    if !can_access_collection(&headers.org_user, &col_id, &mut conn).await {
+                    if !Collection::can_access_collection(&headers.org_user, &col_id, &mut conn).await {
                         err_handler!("The current user isn't a manager for this collection")
                     }
                 }
@@ -678,7 +783,6 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
-                org_user_type: headers.org_user_type,
                 ip: headers.ip,
             })
         } else {
@@ -705,7 +809,6 @@ pub struct ManagerHeadersLoose {
     pub device: Device,
     pub user: User,
     pub org_user: UserOrganization,
-    pub org_user_type: UserOrgType,
     pub ip: ClientIp,
 }
 
@@ -721,7 +824,6 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
                 device: headers.device,
                 user: headers.user,
                 org_user: headers.org_user,
-                org_user_type: headers.org_user_type,
                 ip: headers.ip,
             })
         } else {
@@ -740,10 +842,6 @@ impl From<ManagerHeadersLoose> for Headers {
         }
     }
 }
-async fn can_access_collection(org_user: &UserOrganization, col_id: &str, conn: &mut DbConn) -> bool {
-    org_user.has_full_access()
-        || Collection::has_access_by_collection_and_user_uuid(col_id, &org_user.user_uuid, conn).await
-}
 
 impl ManagerHeaders {
     pub async fn from_loose(
@@ -755,7 +853,7 @@ impl ManagerHeaders {
             if uuid::Uuid::parse_str(col_id).is_err() {
                 err!("Collection Id is malformed!");
             }
-            if !can_access_collection(&h.org_user, col_id, conn).await {
+            if !Collection::can_access_collection(&h.org_user, col_id, conn).await {
                 err!("You don't have access to all collections!");
             }
         }
@@ -764,14 +862,12 @@ impl ManagerHeaders {
             host: h.host,
             device: h.device,
             user: h.user,
-            org_user_type: h.org_user_type,
             ip: h.ip,
         })
     }
 }
 
 pub struct OwnerHeaders {
-    pub host: String,
     pub device: Device,
     pub user: User,
     pub ip: ClientIp,
@@ -785,7 +881,6 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
         if headers.org_user_type == UserOrgType::Owner {
             Outcome::Success(Self {
-                host: headers.host,
                 device: headers.device,
                 user: headers.user,
                 ip: headers.ip,
@@ -799,7 +894,6 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
 //
 // Client IP address detection
 //
-use std::net::IpAddr;
 
 pub struct ClientIp {
     pub ip: IpAddr,
@@ -832,6 +926,35 @@ impl<'r> FromRequest<'r> for ClientIp {
     }
 }
 
+pub struct Secure {
+    pub https: bool,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for Secure {
+    type Error = ();
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = request.headers();
+
+        // Try to guess from the headers
+        let protocol = match headers.get_one("X-Forwarded-Proto") {
+            Some(proto) => proto,
+            None => {
+                if env::var("ROCKET_TLS").is_ok() {
+                    "https"
+                } else {
+                    "http"
+                }
+            }
+        };
+
+        Outcome::Success(Secure {
+            https: protocol == "https",
+        })
+    }
+}
+
 pub struct WsAccessTokenHeader {
     pub access_token: Option<String>,
 }
@@ -853,4 +976,150 @@ impl<'r> FromRequest<'r> for WsAccessTokenHeader {
             access_token,
         })
     }
+}
+
+#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    OrgApiKey,
+    Password,
+    Sso,
+    UserApiKey,
+}
+
+pub trait AuthMethodScope {
+    fn scope_vec(&self) -> Vec<String>;
+    fn scope(&self) -> String;
+    fn check_scope(&self, scope: Option<&String>) -> ApiResult<String>;
+}
+
+impl AuthMethodScope for AuthMethod {
+    fn scope(&self) -> String {
+        match self {
+            AuthMethod::OrgApiKey => "api.organization".to_string(),
+            AuthMethod::Password => "api offline_access".to_string(),
+            AuthMethod::Sso => "api offline_access".to_string(),
+            AuthMethod::UserApiKey => "api".to_string(),
+        }
+    }
+
+    fn scope_vec(&self) -> Vec<String> {
+        self.scope().split_whitespace().map(str::to_string).collect()
+    }
+
+    fn check_scope(&self, scope: Option<&String>) -> ApiResult<String> {
+        let method_scope = self.scope();
+        match scope {
+            None => err!("Missing scope"),
+            Some(scope) if scope == &method_scope => Ok(method_scope),
+            Some(scope) => err!(format!("Scope ({scope}) not supported")),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TokenWrapper {
+    Access(String),
+    Refresh(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RefreshJwtClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: AuthMethod,
+
+    pub device_token: String,
+
+    pub token: Option<TokenWrapper>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthTokens {
+    pub refresh_claims: RefreshJwtClaims,
+    pub access_claims: LoginJwtClaims,
+}
+
+impl AuthTokens {
+    pub fn refresh_token(&self) -> String {
+        encode_jwt(&self.refresh_claims)
+    }
+
+    pub fn access_token(&self) -> String {
+        self.access_claims.token()
+    }
+
+    pub fn expires_in(&self) -> i64 {
+        self.access_claims.expires_in()
+    }
+
+    pub fn scope(&self) -> String {
+        self.refresh_claims.sub.scope()
+    }
+
+    // Create refresh_token and access_token with default validity
+    pub fn new(device: &Device, user: &User, sub: AuthMethod) -> Self {
+        let time_now = Utc::now();
+
+        let access_claims = LoginJwtClaims::default(device, user, &sub);
+
+        let refresh_claims = RefreshJwtClaims {
+            nbf: time_now.timestamp(),
+            exp: (time_now + *DEFAULT_REFRESH_VALIDITY).timestamp(),
+            iss: JWT_LOGIN_ISSUER.to_string(),
+            sub,
+            device_token: device.refresh_token.clone(),
+            token: None,
+        };
+
+        Self {
+            refresh_claims,
+            access_claims,
+        }
+    }
+}
+
+pub async fn refresh_tokens(refresh_token: &str, conn: &mut DbConn) -> ApiResult<(Device, User, AuthTokens)> {
+    let time_now = Utc::now();
+
+    let refresh_claims = match decode_refresh(refresh_token) {
+        Err(err) => err!(format!("Impossible to read refresh_token: {err}")),
+        Ok(claims) => claims,
+    };
+
+    // Get device by refresh token
+    let mut device = match Device::find_by_refresh_token(&refresh_claims.device_token, conn).await {
+        None => err!("Invalid refresh token"),
+        Some(device) => device,
+    };
+
+    // Save to update `updated_at`.
+    device.save(conn).await?;
+
+    let user = match User::find_by_uuid(&device.user_uuid, conn).await {
+        None => err!("Impossible to find user"),
+        Some(user) => user,
+    };
+
+    if refresh_claims.exp < time_now.timestamp() {
+        err!("Expired refresh token");
+    }
+
+    let auth_tokens = match refresh_claims.sub {
+        AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
+            AuthTokens::new(&device, &user, refresh_claims.sub)
+        }
+        AuthMethod::Sso if CONFIG.sso_enabled() => sso::exchange_refresh_token(&device, &user, &refresh_claims).await?,
+        AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
+        AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
+        AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub),
+        _ => err!("Invalid auth method cannot refresh token"),
+    };
+
+    Ok((device, user, auth_tokens))
 }
